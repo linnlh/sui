@@ -13353,6 +13353,7 @@ dependencies = [
  "futures",
  "governor 0.6.0",
  "im",
+ "interprocess",
  "itertools 0.13.0",
  "lru 0.10.0",
  "mockall",

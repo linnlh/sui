@@ -2080,13 +2080,17 @@ impl TransactionCacheRead for WritebackCache {
 }
 
 impl ExecutionCacheWrite for WritebackCache {
-    fn update_underlying(&self) {
+    fn update_underlying(&self, clear_cache: bool) {
         use typed_store::Map;
         self.store
             .perpetual_tables
             .objects
             .try_catch_up_with_primary()
             .unwrap();
+
+        if clear_cache {
+            self.clear();
+        }
     }
     
     fn reload_objects(&self, objects: Vec<(ObjectID, Object)>) {

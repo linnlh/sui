@@ -1,10 +1,11 @@
 use std::{fs, sync::Arc};
- 
+
 use anyhow::Result;
 use interprocess::local_socket::{
     tokio::{prelude::*, Stream},
     GenericNamespaced, ListenerOptions,
 };
+use sui_json_rpc_types::SuiEvent;
 use sui_types::effects::TransactionEffects;
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 
@@ -59,17 +60,31 @@ impl TxHandler {
         }
     }
 
-    pub async fn send_tx_effects(&self, effects: &TransactionEffects) -> Result<()> {
-        let effects_bytes = bcs::to_bytes(effects)?;
-        let len = (effects_bytes.len() as u32).to_be_bytes();
+    pub async fn send_tx_effects_and_events(
+        &self,
+        effects: &TransactionEffects,
+        events: Vec<SuiEvent>,
+    ) -> Result<()> {
+        // Serialize effects and events separately
+        let effects_bytes = bincode::serialize(effects)?;
+        let events_bytes = serde_json::to_vec(&events)?;
+
+        // Get lengths as BE bytes
+        let effects_len_bytes = (effects_bytes.len() as u32).to_be_bytes();
+        let events_len_bytes = (events_bytes.len() as u32).to_be_bytes();
 
         let mut conns = self.conns.lock().await;
         let mut active_conns = Vec::new();
 
         while let Some(mut conn) = conns.pop() {
             let result: Result<()> = async {
-                conn.write_all(&len).await?;
+                // Write effects length and data
+                conn.write_all(&effects_len_bytes).await?;
                 conn.write_all(&effects_bytes).await?;
+
+                // Write events length and data
+                conn.write_all(&events_len_bytes).await?;
+                conn.write_all(&events_bytes).await?;
                 Ok(())
             }
             .await;

@@ -1,4 +1,4 @@
-use bincode;
+use dashmap::DashSet;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -13,6 +13,22 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 const SOCKET_PATH: &str = "/tmp/sui_cache_updates.sock";
+pub const POOL_RELATED_OBJECTS_PATH: &str = "/home/ubuntu/sui/pool_related_ids.txt";
+
+pub fn pool_related_object_ids() -> DashSet<ObjectID> {
+    let content = std::fs::read_to_string(POOL_RELATED_OBJECTS_PATH)
+        .unwrap_or_else(|_| panic!("Failed to open: {}", POOL_RELATED_OBJECTS_PATH));
+
+    let set = DashSet::new();
+    content
+        .trim()
+        .split('\n')
+        .map(|line| line.parse().expect("Failed to parse pool_related_ids"))
+        .for_each(|id| {
+            set.insert(id);
+        });
+    set
+}
 
 #[derive(Debug)]
 pub struct CacheUpdateHandler {
@@ -59,19 +75,8 @@ impl CacheUpdateHandler {
         }
     }
 
-    pub async fn update_cache(&self, packages: Vec<(ObjectID, Object)>) {
-        if packages.is_empty() {
-            return;
-        }
-
-        let serialized = match bincode::serialize(&packages) {
-            Ok(serialized) => serialized,
-            Err(e) => {
-                error!("Error serializing cache update: {}", e);
-                return;
-            }
-        };
-
+    pub async fn notify_written(&self, objects: Vec<(ObjectID, Object)>) {
+        let serialized = bcs::to_bytes(&objects).expect("serialization error");
         let len = serialized.len() as u32;
         let len_bytes = len.to_le_bytes();
 

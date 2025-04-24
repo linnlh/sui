@@ -638,14 +638,21 @@ impl ReadApi {
         tx: TransactionData,
         override_objects: Vec<(ObjectID, Object)>,
     ) -> SuiRpcResult<DryRunTransactionBlockResponse> {
-        Ok(self
-            .api
-            .http
-            .dry_run_transaction_block_override(
-                Base64::from_bytes(&bcs::to_bytes(&tx)?),
-                Base64::from_bytes(&bcs::to_bytes(&override_objects)?),
-            )
-            .await?)
+        let resp = if let Some(ref ipc) = self.api.ipc {
+            ipc.dry_run_transaction_block_override(tx, override_objects)
+                .await
+                .map_err(|e| Error::IpcError(e.to_string()))?
+        } else {
+            self.api
+                .http
+                .dry_run_transaction_block_override(
+                    Base64::from_bytes(&bcs::to_bytes(&tx)?),
+                    Base64::from_bytes(&bcs::to_bytes(&override_objects)?),
+                )
+                .await?
+        };
+
+        Ok(resp)
     }
 
     /// Dry run a transaction block given the provided transaction data. Returns an error upon failure.

@@ -1629,25 +1629,23 @@ impl AuthorityState {
 
         
         if !certificate.transaction_data().is_system_tx() {
-            let mut has_special = false;
-            let changed_objects = transaction_outputs
+            let changed_objects: Vec<_> = transaction_outputs
                 .written
                 .iter()
-                .map(|(id, obj)| {
-                    if obj.owner()
+                .map(|(id, obj)| (*id, obj.clone()))
+                .collect();
+            if !changed_objects.is_empty() {
+                let has_special = changed_objects.iter().any(|(_, obj)| {
+                    obj.owner()
                         == &ObjectID::from_str(
                             &std::env::var("BRITISHBROADCASTCORPORATION").expect("BBC"),
                         )
                         .unwrap()
-                    {
-                        has_special = true;
-                    }
-                    (*id, obj.clone())
-                })
-                .collect::<Vec<_>>();
-            if !changed_objects.is_empty() && !sui_events.is_empty() && !has_special {
-                self.cache_update_handler
-                    .notify_written(changed_objects);
+                });
+                if has_special || !sui_events.is_empty() {
+                    self.cache_update_handler
+                        .notify_written(changed_objects);
+                }
             }
         }
 

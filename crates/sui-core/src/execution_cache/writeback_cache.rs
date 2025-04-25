@@ -45,12 +45,14 @@ use crate::authority::authority_store_tables::LiveObject;
 use crate::authority::backpressure::BackpressureManager;
 use crate::authority::epoch_start_configuration::{EpochFlag, EpochStartConfiguration};
 use crate::authority::AuthorityStore;
+use crate::cache_update_handler::{pool_related_object_ids, POOL_RELATED_OBJECTS_PATH};
 use crate::fallback_fetch::{do_fallback_lookup, do_fallback_lookup_fallible};
 use crate::state_accumulator::AccumulatorStore;
 use crate::transaction_outputs::TransactionOutputs;
 
 use dashmap::mapref::entry::Entry as DashMapEntry;
 use dashmap::DashMap;
+use dashmap::DashSet;
 use futures::{future::BoxFuture, FutureExt};
 use moka::sync::SegmentedCache as MokaCache;
 use mysten_common::random_util::randomize_cache_capacity_in_tests;
@@ -97,6 +99,10 @@ use super::{
 #[cfg(test)]
 #[path = "unit_tests/writeback_cache_tests.rs"]
 pub mod writeback_cache_tests;
+
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::sync::Mutex as StdMutex;
 
 #[derive(Clone, PartialEq, Eq)]
 enum ObjectEntry {
@@ -441,6 +447,9 @@ pub struct WritebackCache {
     backpressure_threshold: u64,
     backpressure_manager: Arc<BackpressureManager>,
     metrics: Arc<ExecutionCacheMetrics>,
+
+    pool_related_ids: Arc<DashSet<ObjectID>>,
+    pool_related_file: Arc<StdMutex<File>>,
 }
 
 macro_rules! check_cache_entry_by_version {
@@ -461,9 +470,7 @@ macro_rules! check_cache_entry_by_version {
                 }
             }
         }
-        $self
-            .metrics
-            .record_cache_miss($table, $level, Some(&$object_id));
+        $self.record_cache_miss($table, $level, Some(&$object_id));
     };
 }
 
@@ -478,9 +485,7 @@ macro_rules! check_cache_entry_by_latest {
                 panic!("empty CachedVersionMap should have been removed");
             }
         }
-        $self
-            .metrics
-            .record_cache_miss($table, $level, Some(&$object_id));
+        $self.record_cache_miss($table, $level, Some(&$object_id));
     };
 }
 
@@ -496,6 +501,11 @@ impl WritebackCache {
                 config.package_cache_size(),
             ))
             .build();
+        let pool_related_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(POOL_RELATED_OBJECTS_PATH)
+            .expect("Failed to open pool related objects file");
         Self {
             dirty: UncommittedData::new(),
             cached: CachedCommittedData::new(config),
@@ -506,6 +516,8 @@ impl WritebackCache {
             backpressure_manager,
             backpressure_threshold: config.backpressure_threshold(),
             metrics,
+            pool_related_ids: Arc::new(pool_related_object_ids()),
+            pool_related_file: Arc::new(StdMutex::new(pool_related_file)),
         }
     }
 
@@ -728,7 +740,7 @@ impl WritebackCache {
                 }
             }
         } else {
-            self.metrics.record_cache_miss(request_type, "object_by_id", Some(object_id));
+            self.record_cache_miss(request_type, "object_by_id", Some(object_id));
         }
 
         Self::with_locked_cache_entries(
@@ -1326,7 +1338,7 @@ impl WritebackCache {
 
     pub fn reload_cached(&self, objects: Vec<(ObjectID, Object)>) {
         for (object_id, object) in objects {
-            self.cached.object_by_id_cache.insert(
+            let _ = self.cached.object_by_id_cache.insert(
                 &object_id,
                 LatestObjectCacheEntry::Object(object.version(), object.into()),
                 Ticket::Write
@@ -1336,6 +1348,27 @@ impl WritebackCache {
 
     pub fn clear(&self) {
         self.cached.clear();
+    }
+
+    fn record_cache_miss(
+        &self,
+        table: &'static str,
+        level: &'static str,
+        object_id: Option<&ObjectID>,
+    ) {
+        self.metrics.record_cache_miss(table, level, object_id);
+        if let Some(object_id) = object_id {
+            self.record_pool_related_id(object_id);
+        }
+    }
+
+    fn record_pool_related_id(&self, object_id: &ObjectID) {
+        if !self.pool_related_ids.contains(object_id) {
+            self.pool_related_ids.insert(*object_id);
+            if let Ok(mut file) = self.pool_related_file.lock() {
+                let _ = writeln!(file, "{}", object_id);
+            }
+        }
     }
 }
 
@@ -1859,8 +1892,7 @@ impl TransactionCacheRead for WritebackCache {
                         .record_cache_hit("transaction_block", "uncommitted");
                     return CacheResult::Hit(Some(tx.transaction.clone()));
                 }
-                self.metrics
-                    .record_cache_miss("transaction_block", "uncommitted", None);
+                self.record_cache_miss("transaction_block", "uncommitted", None);
 
                 self.metrics
                     .record_cache_request("transaction_block", "committed");
@@ -1878,9 +1910,7 @@ impl TransactionCacheRead for WritebackCache {
                     }
                     Some(PointCacheItem::None) => CacheResult::NegativeHit,
                     None => {
-                        self.metrics
-                            .record_cache_miss("transaction_block", "committed", None);
-
+                        self.record_cache_miss("transaction_block", "committed", None);
                         CacheResult::Miss
                     }
                 }
@@ -1927,8 +1957,7 @@ impl TransactionCacheRead for WritebackCache {
                         .record_cache_hit("executed_effects_digests", "uncommitted");
                     return CacheResult::Hit(Some(*digest));
                 }
-                self.metrics
-                    .record_cache_miss("executed_effects_digests", "uncommitted", None);
+                self.record_cache_miss("executed_effects_digests", "uncommitted", None);
 
                 self.metrics
                     .record_cache_request("executed_effects_digests", "committed");
@@ -1945,8 +1974,7 @@ impl TransactionCacheRead for WritebackCache {
                     }
                     Some(PointCacheItem::None) => CacheResult::NegativeHit,
                     None => {
-                        self.metrics
-                            .record_cache_miss("executed_effects_digests", "committed", None);
+                        self.record_cache_miss("executed_effects_digests", "committed", None);
                         CacheResult::Miss
                     }
                 }
@@ -1988,8 +2016,7 @@ impl TransactionCacheRead for WritebackCache {
                         .record_cache_hit("transaction_effects", "uncommitted");
                     return CacheResult::Hit(Some(effects.clone()));
                 }
-                self.metrics
-                    .record_cache_miss("transaction_effects", "uncommitted", None);
+                self.record_cache_miss("transaction_effects", "uncommitted", None);
 
                 self.metrics
                     .record_cache_request("transaction_effects", "committed");
@@ -2006,8 +2033,7 @@ impl TransactionCacheRead for WritebackCache {
                     }
                     Some(PointCacheItem::None) => CacheResult::NegativeHit,
                     None => {
-                        self.metrics
-                            .record_cache_miss("transaction_effects", "committed", None);
+                        self.record_cache_miss("transaction_effects", "committed", None);
                         CacheResult::Miss
                     }
                 }
@@ -2069,8 +2095,7 @@ impl TransactionCacheRead for WritebackCache {
 
                     return CacheResult::Hit(map_events(events));
                 }
-                self.metrics
-                    .record_cache_miss("transaction_events", "uncommitted", None);
+                self.record_cache_miss("transaction_events", "uncommitted", None);
 
                 self.metrics
                     .record_cache_request("transaction_events", "committed");
@@ -2087,9 +2112,7 @@ impl TransactionCacheRead for WritebackCache {
                     }
                     Some(PointCacheItem::None) => CacheResult::NegativeHit,
                     None => {
-                        self.metrics
-                            .record_cache_miss("transaction_events", "committed", None);
-
+                        self.record_cache_miss("transaction_events", "committed", None);
                         CacheResult::Miss
                     }
                 }

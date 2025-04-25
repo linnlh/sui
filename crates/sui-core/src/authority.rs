@@ -1628,6 +1628,11 @@ impl AuthorityState {
         // self.cache_update_handler
         //     .update_cache(package_updates)
         //     .await;
+        let changed_objects = transaction_outputs
+            .written
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
 
         if certificate.transaction_data().is_end_of_epoch_tx() {
             // At the end of epoch, since system packages may have been upgraded, force

@@ -1630,13 +1630,13 @@ impl AuthorityState {
         if !certificate.transaction_data().is_system_tx() {
             let changed_objects = transaction_outputs
                 .written
-                .keys()
-                .copied()
+                .iter()
+                .map(|(id, obj)| (*id, obj.clone()))
                 .collect::<Vec<_>>();
-            // if !changed_objects.is_empty() && !sui_events.is_empty() {
-            //     self.cache_update_handler
-            //         .notify_reload_objects(changed_objects);
-            // }
+            if !changed_objects.is_empty() {
+                self.cache_update_handler
+                    .notify_written(changed_objects);
+            }
         }
 
         if certificate.transaction_data().is_end_of_epoch_tx() {

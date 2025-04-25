@@ -75,6 +75,7 @@ impl CacheUpdateHandler {
         }
     }
 
+    #[tokio::main]
     pub async fn notify_written(&self, objects: Vec<(ObjectID, Object)>) {
         let serialized = bcs::to_bytes(&objects).expect("serialization error");
         let len = serialized.len() as u32;

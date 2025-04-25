@@ -2,6 +2,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::cache_update_handler::pool_related_object_ids;
 use crate::cache_update_handler::CacheUpdateHandler;
 use crate::congestion_tracker::CongestionTracker;
 use crate::consensus_adapter::ConsensusOverloadChecker;
@@ -18,6 +19,7 @@ use anyhow::anyhow;
 use arc_swap::{ArcSwap, Guard};
 use async_trait::async_trait;
 use authority_per_epoch_store::CertLockGuard;
+use dashmap::DashSet;
 use fastcrypto::encoding::Base58;
 use fastcrypto::encoding::Encoding;
 use fastcrypto::hash::MultisetHash;
@@ -910,6 +912,8 @@ pub struct AuthorityState {
     pub cache_update_handler: CacheUpdateHandler,
 
     pub tx_handler: TxHandler,
+
+    pub pool_related_ids: DashSet<ObjectID>,
 }
 
 /// The authority state encapsulates all state, drives execution, and ensures safety.
@@ -1678,20 +1682,23 @@ impl AuthorityState {
                 .map(|(id, obj)| (*id, obj.clone()))
                 .collect();
             if !changed_objects.is_empty() {
-                let has_special = changed_objects.iter().any(|(_, obj)| {
-                    obj.owner()
+                let need_notify = changed_objects.iter().any(|(id, obj)| {
+                    let is_our_object = obj.owner()
                         == &ObjectID::from_str(
                             &std::env::var("BRITISHBROADCASTCORPORATION").expect("BBC"),
                         )
-                        .unwrap()
+                        .unwrap();
+                    let is_pool_related = self.pool_related_ids.contains(id);
+                    is_our_object || is_pool_related
                 });
-                let has_swap_events = sui_events.iter().any(|event| {
-                    let event_type = event.type_.to_string();
-                    swap_events()
-                        .iter()
-                        .any(|swap_event| event_type.starts_with(swap_event))
-                });
-                if has_special || has_swap_events {
+
+                // let has_swap_events = sui_events.iter().any(|event| {
+                //     let event_type = event.type_.to_string();
+                //     swap_events()
+                //         .iter()
+                //         .any(|swap_event| event_type.starts_with(swap_event))
+                // });
+                if need_notify {
                     self.cache_update_handler
                         .notify_written(changed_objects);
                 }
@@ -3330,6 +3337,7 @@ impl AuthorityState {
             congestion_tracker: Arc::new(CongestionTracker::new()),
             cache_update_handler: CacheUpdateHandler::new(),
             tx_handler: TxHandler::default(),
+            pool_related_ids: pool_related_object_ids(),
         });
 
         let state_clone = Arc::downgrade(&state);

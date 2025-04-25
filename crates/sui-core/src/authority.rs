@@ -1627,7 +1627,7 @@ impl AuthorityState {
         }
 
         self.get_cache_writer()
-            .write_transaction_outputs(epoch_store.epoch(), transaction_outputs);
+            .write_transaction_outputs(epoch_store.epoch(), Arc::clone(&transaction_outputs));
         // self.cache_update_handler
         //     .update_cache(package_updates)
         //     .await;

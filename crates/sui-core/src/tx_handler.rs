@@ -60,6 +60,7 @@ impl TxHandler {
         }
     }
 
+    #[tokio::main]
     pub async fn send_tx_effects_and_events(
         &self,
         effects: &TransactionEffects,

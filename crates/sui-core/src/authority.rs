@@ -909,9 +909,9 @@ pub struct AuthorityState {
 
     pub(crate) congestion_tracker: Arc<CongestionTracker>,
 
-    pub cache_update_handler: CacheUpdateHandler,
+    pub cache_update_handler: Arc<CacheUpdateHandler>,
 
-    pub tx_handler: TxHandler,
+    pub tx_handler: Arc<TxHandler>,
 
     pub pool_related_ids: DashSet<ObjectID>,
 }
@@ -1674,9 +1674,9 @@ impl AuthorityState {
         self.get_cache_writer()
             .write_transaction_outputs(epoch_store.epoch(), Arc::clone(&transaction_outputs));
 
-        
+        let handle = tokio::runtime::Handle::current();
         if !certificate.transaction_data().is_system_tx() {
-            let changed_objects: Vec<_> = transaction_outputs
+            let changed_objects: Vec<(ObjectID, Object)> = transaction_outputs
                 .written
                 .iter()
                 .map(|(id, obj)| (*id, obj.clone()))
@@ -1692,15 +1692,11 @@ impl AuthorityState {
                     is_our_object || is_pool_related
                 });
 
-                // let has_swap_events = sui_events.iter().any(|event| {
-                //     let event_type = event.type_.to_string();
-                //     swap_events()
-                //         .iter()
-                //         .any(|swap_event| event_type.starts_with(swap_event))
-                // });
+                let cache_update_handler_clone = self.cache_update_handler.clone();
                 if need_notify {
-                    self.cache_update_handler
-                        .notify_written(changed_objects);
+                    handle.spawn(async move {
+                        cache_update_handler_clone.notify_written(changed_objects).await;
+                    });
                 }
             }
         }
@@ -1719,9 +1715,11 @@ impl AuthorityState {
             && !sui_events.is_empty()
             && !transaction_outputs.written.is_empty()
         {
-            let _ = self
-            .tx_handler
-            .send_tx_effects_and_events(effects, sui_events);
+            let tx_handler_clone = self.tx_handler.clone();
+            let effects_clone = effects.clone();
+            handle.spawn(async move {
+                let _ = tx_handler_clone.send_tx_effects_and_events(effects_clone, sui_events).await;
+            });
         }
         
 
@@ -3335,8 +3333,8 @@ impl AuthorityState {
             validator_tx_finalizer,
             chain_identifier,
             congestion_tracker: Arc::new(CongestionTracker::new()),
-            cache_update_handler: CacheUpdateHandler::new(),
-            tx_handler: TxHandler::default(),
+            cache_update_handler: Arc::new(CacheUpdateHandler::new()),
+            tx_handler: Arc::new(TxHandler::default()),
             pool_related_ids: pool_related_object_ids(),
         });
 

@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 const SOCKET_PATH: &str = "/tmp/sui_cache_updates.sock";
-pub const POOL_RELATED_OBJECTS_PATH: &str = "/root/sui-mev/pool_related_ids.txt";
+pub const POOL_RELATED_OBJECTS_PATH: &str = "/mnt/data/db/pool_related_ids.txt";
 
 pub fn pool_related_object_ids() -> DashSet<ObjectID> {
     let content = std::fs::read_to_string(POOL_RELATED_OBJECTS_PATH)
@@ -75,7 +75,6 @@ impl CacheUpdateHandler {
         }
     }
 
-    #[tokio::main]
     pub async fn notify_written(&self, objects: Vec<(ObjectID, Object)>) {
         let serialized = bcs::to_bytes(&objects).expect("serialization error");
         let len = serialized.len() as u32;

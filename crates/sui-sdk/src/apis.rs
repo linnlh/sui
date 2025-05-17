@@ -15,6 +15,7 @@ use sui_json_rpc_types::DevInspectArgs;
 use sui_json_rpc_types::SuiData;
 use sui_json_rpc_types::ZkLoginIntentScope;
 use sui_json_rpc_types::ZkLoginVerifyResult;
+use sui_types::object::Object;
 
 use crate::error::{Error, SuiRpcResult};
 use crate::RpcClient;
@@ -630,6 +631,28 @@ impl ReadApi {
     /// Return the reference gas price, or an error upon failure.
     pub async fn get_reference_gas_price(&self) -> SuiRpcResult<u64> {
         Ok(*self.api.http.get_reference_gas_price().await?)
+    }
+
+    pub async fn dry_run_transaction_block_override(
+        &self,
+        tx: TransactionData,
+        override_objects: Vec<(ObjectID, Object)>,
+    ) -> SuiRpcResult<DryRunTransactionBlockResponse> {
+        let resp = if let Some(ref ipc) = self.api.ipc {
+            ipc.dry_run_transaction_block_override(tx, override_objects)
+                .await
+                .map_err(|e| Error::IpcError(e.to_string()))?
+        } else {
+            self.api
+                .http
+                .dry_run_transaction_block_override(
+                    Base64::from_bytes(&bcs::to_bytes(&tx)?),
+                    Base64::from_bytes(&bcs::to_bytes(&override_objects)?),
+                )
+                .await?
+        };
+
+        Ok(resp)
     }
 
     /// Dry run a transaction block given the provided transaction data. Returns an error upon failure.

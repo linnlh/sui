@@ -2,18 +2,24 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::cache_update_handler::pool_related_object_ids;
+use crate::cache_update_handler::CacheUpdateHandler;
 use crate::congestion_tracker::CongestionTracker;
 use crate::consensus_adapter::ConsensusOverloadChecker;
 use crate::execution_cache::ExecutionCacheTraitPointers;
 use crate::execution_cache::TransactionCacheRead;
 use crate::jsonrpc_index::CoinIndexKey2;
+use crate::override_cache::InputLoaderCache;
+use crate::override_cache::ObjectCache;
 use crate::rpc_index::RpcIndexStore;
 use crate::transaction_outputs::TransactionOutputs;
+use crate::tx_handler::TxHandler;
 use crate::verify_indexes::{fix_indexes, verify_indexes};
 use anyhow::anyhow;
 use arc_swap::{ArcSwap, Guard};
 use async_trait::async_trait;
 use authority_per_epoch_store::CertLockGuard;
+use dashmap::DashSet;
 use fastcrypto::encoding::Base58;
 use fastcrypto::encoding::Encoding;
 use fastcrypto::hash::MultisetHash;
@@ -49,6 +55,7 @@ use std::{
     sync::Arc,
     vec,
 };
+use std::str::FromStr;
 use sui_config::node::{AuthorityOverloadConfig, StateDebugDumpConfig};
 use sui_config::NodeConfig;
 use sui_protocol_config::PerObjectCongestionControlMode;
@@ -73,7 +80,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use self::authority_store::ExecutionLockWriteGuard;
 use self::authority_store_pruner::AuthorityStorePruningMetrics;
-pub use authority_store::{AuthorityStore, ResolverWrapper, UpdateType};
+pub use authority_store::{AuthorityStore, ResolverWrapper, SuiLockResult, UpdateType};
 use mysten_metrics::{monitored_scope, spawn_monitored_task};
 
 use crate::jsonrpc_index::IndexStore;
@@ -857,6 +864,12 @@ pub struct AuthorityState {
     chain_identifier: ChainIdentifier,
 
     pub(crate) congestion_tracker: Arc<CongestionTracker>,
+
+    pub cache_update_handler: Arc<CacheUpdateHandler>,
+
+    pub tx_handler: Arc<TxHandler>,
+
+    pub pool_related_ids: DashSet<ObjectID>,
 }
 
 /// The authority state encapsulates all state, drives execution, and ensures safety.
@@ -1552,6 +1565,28 @@ impl AuthorityState {
         _execution_guard: ExecutionLockReadGuard<'_>,
         epoch_store: &Arc<AuthorityPerEpochStore>,
     ) -> SuiResult {
+        let raw_events = inner_temporary_store.events.clone();
+        let sui_events: Vec<SuiEvent> = raw_events
+            .data
+            .iter()
+            .enumerate()
+            .map(|(seq, event)| {
+                let mut layout_resolver = epoch_store.executor().type_layout_resolver(Box::new(
+                    PackageStoreWithFallback::new(
+                        &inner_temporary_store,
+                        self.get_backing_package_store(),
+                    ),
+                ));
+                let layout = layout_resolver.get_annotated_layout(&event.type_)?;
+                SuiEvent::try_from(
+                    event.clone(),
+                    *certificate.digest(),
+                    seq as u64,
+                    None,
+                    layout,
+                )
+            })
+            .collect::<Result<_, _>>()?;
         let _scope: Option<mysten_metrics::MonitoredScopeGuard> =
             monitored_scope("Execution::commit_certificate");
         let _metrics_guard = self.metrics.commit_certificate_latency.start_timer();
@@ -1578,13 +1613,46 @@ impl AuthorityState {
         // Allow testing what happens if we crash here.
         fail_point!("crash");
 
-        let transaction_outputs = TransactionOutputs::build_transaction_outputs(
+        let transaction_outputs = Arc::new(TransactionOutputs::build_transaction_outputs(
             certificate.clone().into_unsigned(),
             effects.clone(),
             inner_temporary_store,
-        );
+        ));
+        let mut package_updates = Vec::new();
+        for (id, object) in transaction_outputs.written.iter() {
+            if object.is_package() {
+                package_updates.push((*id, object.clone()));
+            }
+        }
         self.get_cache_writer()
-            .write_transaction_outputs(epoch_store.epoch(), transaction_outputs.into());
+            .write_transaction_outputs(epoch_store.epoch(), Arc::clone(&transaction_outputs));
+
+        let handle = tokio::runtime::Handle::current();
+        if !certificate.transaction_data().is_system_tx() {
+            let changed_objects: Vec<(ObjectID, Object)> = transaction_outputs
+                .written
+                .iter()
+                .map(|(id, obj)| (*id, obj.clone()))
+                .collect();
+            if !changed_objects.is_empty() {
+                let need_notify = changed_objects.iter().any(|(id, obj)| {
+                    let is_our_object = obj.owner()
+                        == &ObjectID::from_str(
+                            &std::env::var("BRITISHBROADCASTCORPORATION").expect("BBC"),
+                        )
+                        .unwrap();
+                    let is_pool_related = self.pool_related_ids.contains(id);
+                    is_our_object || is_pool_related
+                });
+
+                let cache_update_handler_clone = self.cache_update_handler.clone();
+                if need_notify {
+                    handle.spawn(async move {
+                        cache_update_handler_clone.notify_written(changed_objects).await;
+                    });
+                }
+            }
+        }
 
         if certificate.transaction_data().is_end_of_epoch_tx() {
             // At the end of epoch, since system packages may have been upgraded, force
@@ -1595,6 +1663,17 @@ impl AuthorityState {
 
         // commit_certificate finished, the tx is fully committed to the store.
         tx_guard.commit_tx();
+
+        if !certificate.transaction_data().is_system_tx()
+            && !sui_events.is_empty()
+            && !transaction_outputs.written.is_empty()
+        {
+            let tx_handler_clone = self.tx_handler.clone();
+            let effects_clone = effects.clone();
+            handle.spawn(async move {
+                let _ = tx_handler_clone.send_tx_effects_and_events(effects_clone, sui_events).await;
+            });
+        }
 
         // Notifies transaction manager about transaction and output objects committed.
         // This provides necessary information to transaction manager to start executing
@@ -1760,6 +1839,41 @@ impl AuthorityState {
 
     #[instrument(skip_all)]
     #[allow(clippy::type_complexity)]
+    pub async fn dry_exec_transaction_override_objects(
+        &self,
+        transaction: TransactionData,
+        transaction_digest: TransactionDigest,
+        override_objects: Vec<(ObjectID, Object)>,
+    ) -> SuiResult<(
+        DryRunTransactionBlockResponse,
+        BTreeMap<ObjectID, (ObjectRef, Object, WriteKind)>,
+        TransactionEffects,
+        Option<ObjectID>,
+    )> {
+        let epoch_store = self.load_epoch_store_one_call_per_task();
+        if !self.is_fullnode(&epoch_store) {
+            return Err(SuiError::UnsupportedFeatureError {
+                error: "dry-exec is only supported on fullnodes".to_string(),
+            });
+        }
+
+        if transaction.kind().is_system_tx() {
+            return Err(SuiError::UnsupportedFeatureError {
+                error: "dry-exec does not support system transactions".to_string(),
+            });
+        }
+
+        self.dry_exec_transaction_override_impl(
+            &epoch_store,
+            transaction,
+            transaction_digest,
+            override_objects,
+        )
+        .await
+    }
+
+    #[instrument(skip_all)]
+    #[allow(clippy::type_complexity)]
     pub async fn dry_exec_transaction(
         &self,
         transaction: TransactionData,
@@ -1799,6 +1913,200 @@ impl AuthorityState {
     )> {
         let epoch_store = self.load_epoch_store_one_call_per_task();
         self.dry_exec_transaction_impl(&epoch_store, transaction, transaction_digest)
+    }
+
+    async fn dry_exec_transaction_override_impl(
+        &self,
+        epoch_store: &AuthorityPerEpochStore,
+        transaction: TransactionData,
+        transaction_digest: TransactionDigest,
+        override_objects: Vec<(ObjectID, Object)>,
+    ) -> SuiResult<(
+        DryRunTransactionBlockResponse,
+        BTreeMap<ObjectID, (ObjectRef, Object, WriteKind)>,
+        TransactionEffects,
+        Option<ObjectID>,
+    )> {
+        // Cheap validity checks for a transaction, including input size limits.
+        transaction.validity_check_no_gas_check(epoch_store.protocol_config())?;
+
+        let input_object_kinds = transaction.input_objects()?;
+        let receiving_object_refs = transaction.receiving_objects();
+
+        sui_transaction_checks::deny::check_transaction_for_signing(
+            &transaction,
+            &[],
+            &input_object_kinds,
+            &receiving_object_refs,
+            &self.config.transaction_deny_config,
+            self.get_backing_package_store().as_ref(),
+        )?;
+
+        let cached_input_loader = InputLoaderCache {
+            loader: &self.input_loader,
+            cache: override_objects.clone(),
+        };
+        let (input_objects, receiving_objects) = match cached_input_loader.read_objects_for_signing(
+            // We don't want to cache this transaction since it's a dry run.
+            None,
+            &input_object_kinds,
+            &receiving_object_refs,
+            epoch_store.epoch(),
+        ) {
+            Ok((input_objects, receiving_objects)) => (input_objects, receiving_objects),
+            Err(e) => {
+                return Err(e);
+            }
+        };
+
+        // make a gas object if one was not provided
+        let mut gas_data = transaction.gas_data().clone();
+        let ((gas_status, checked_input_objects), mock_gas) = if transaction.gas().is_empty() {
+            let sender = transaction.sender();
+            // use a 1B sui coin
+            const MIST_TO_SUI: u64 = 1_000_000_000;
+            const DRY_RUN_SUI: u64 = 1_000_000_000;
+            let max_coin_value = MIST_TO_SUI * DRY_RUN_SUI;
+            let gas_object_id = ObjectID::random();
+            let gas_object = Object::new_move(
+                MoveObject::new_gas_coin(OBJECT_START_VERSION, gas_object_id, max_coin_value),
+                Owner::AddressOwner(sender),
+                TransactionDigest::genesis_marker(),
+            );
+            let gas_object_ref = gas_object.compute_object_reference();
+            gas_data.payment = vec![gas_object_ref];
+            (
+                sui_transaction_checks::check_transaction_input_with_given_gas(
+                    epoch_store.protocol_config(),
+                    epoch_store.reference_gas_price(),
+                    &transaction,
+                    input_objects,
+                    receiving_objects,
+                    gas_object,
+                    &self.metrics.bytecode_verifier_metrics,
+                    &self.config.verifier_signing_config,
+                )?,
+                Some(gas_object_id),
+            )
+        } else {
+            (
+                sui_transaction_checks::check_transaction_input(
+                    epoch_store.protocol_config(),
+                    epoch_store.reference_gas_price(),
+                    &transaction,
+                    input_objects,
+                    &receiving_objects,
+                    &self.metrics.bytecode_verifier_metrics,
+                    &self.config.verifier_signing_config,
+                )?,
+                None,
+            )
+        };
+
+
+        let protocol_config = epoch_store.protocol_config();
+        let (kind, signer, _) = transaction.execution_parts();
+
+        let silent = true;
+        let executor = sui_execution::executor(protocol_config, silent, None)
+            .expect("Creating an executor should not fail here");
+
+        let expensive_checks = false;
+        let object_cache = ObjectCache::new(Arc::clone(self.get_backing_store()), override_objects);
+        let (inner_temp_store, _, effects, _timings, execution_error) = executor
+            .execute_transaction_to_effects(
+                &object_cache,
+                protocol_config,
+                self.metrics.limits_metrics.clone(),
+                expensive_checks,
+                self.config.certificate_deny_config.certificate_deny_set(),
+                &epoch_store.epoch_start_config().epoch_data().epoch_id(),
+                epoch_store
+                    .epoch_start_config()
+                    .epoch_data()
+                    .epoch_start_timestamp(),
+                checked_input_objects,
+                gas_data,
+                gas_status,
+                kind,
+                signer,
+                transaction_digest,
+                &mut None,
+            );
+        let tx_digest = *effects.transaction_digest();
+
+        let module_cache =
+            TemporaryModuleResolver::new(&inner_temp_store, epoch_store.module_cache().clone());
+
+        let mut layout_resolver =
+            epoch_store
+                .executor()
+                .type_layout_resolver(Box::new(PackageStoreWithFallback::new(
+                    &inner_temp_store,
+                    self.get_backing_package_store(),
+                )));
+        // Returning empty vector here because we recalculate changes in the rpc layer.
+        let object_changes = Vec::new();
+
+        // Returning empty vector here because we recalculate changes in the rpc layer.
+        let balance_changes = Vec::new();
+
+        let written_with_kind = effects
+            .created()
+            .into_iter()
+            .map(|(oref, _)| (oref, WriteKind::Create))
+            .chain(
+                effects
+                    .unwrapped()
+                    .into_iter()
+                    .map(|(oref, _)| (oref, WriteKind::Unwrap)),
+            )
+            .chain(
+                effects
+                    .mutated()
+                    .into_iter()
+                    .map(|(oref, _)| (oref, WriteKind::Mutate)),
+            )
+            .map(|(oref, kind)| {
+                let obj = inner_temp_store.written.get(&oref.0).unwrap();
+                // TODO: Avoid clones.
+                (oref.0, (oref, obj.clone(), kind))
+            })
+            .collect();
+
+        let execution_error_source = execution_error
+            .as_ref()
+            .err()
+            .and_then(|e| e.source().as_ref().map(|e| e.to_string()));
+
+        Ok((
+            DryRunTransactionBlockResponse {
+                suggested_gas_price: self
+                        .congestion_tracker
+                        .get_suggested_gas_prices(&transaction),
+                input: SuiTransactionBlockData::try_from_with_module_cache(transaction, &module_cache).map_err(
+                    |e| SuiError::TransactionSerializationError {
+                        error: format!(
+                            "Failed to convert transaction to SuiTransactionBlockData: {}",
+                            e
+                        ),
+                    },
+                )?, // TODO: replace the underlying try_from to SuiError. This one goes deep
+                effects: effects.clone().try_into()?,
+                events: SuiTransactionBlockEvents::try_from(
+                    inner_temp_store.events.clone(),
+                    tx_digest,
+                    None,
+                    layout_resolver.as_mut(),
+                )?,
+                object_changes,
+                balance_changes,
+                execution_error_source,
+            },
+            written_with_kind,
+            effects,
+            mock_gas,
+        ))
     }
 
     #[allow(clippy::type_complexity)]
@@ -2975,6 +3283,9 @@ impl AuthorityState {
             validator_tx_finalizer,
             chain_identifier,
             congestion_tracker: Arc::new(CongestionTracker::new()),
+            cache_update_handler: Arc::new(CacheUpdateHandler::new()),
+            tx_handler: Arc::new(TxHandler::default()),
+            pool_related_ids: pool_related_object_ids(),
         });
 
         let state_clone = Arc::downgrade(&state);

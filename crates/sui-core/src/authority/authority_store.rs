@@ -165,7 +165,7 @@ impl AuthorityStore {
                 .expect("Epoch start configuration must be set in non-empty DB")
         };
         let cur_epoch = perpetual_tables.get_recovery_epoch_at_restart()?;
-        info!("Epoch start config: {:?}", epoch_start_configuration);
+        // info!("Epoch start config: {:?}", epoch_start_configuration);
         info!("Cur epoch: {:?}", cur_epoch);
         let this = Self::open_inner(
             genesis,
